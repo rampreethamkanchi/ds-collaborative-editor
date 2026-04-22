@@ -25,6 +25,7 @@ const (
 	// Client → Server
 	MsgConnect MsgType = "CONNECT"
 	MsgSubmit  MsgType = "SUBMIT"
+	MsgPing    MsgType = "PING"
 
 	// Server → Client
 	MsgConnectAck MsgType = "CONNECT_ACK"
@@ -32,6 +33,7 @@ const (
 	MsgBroadcast  MsgType = "BROADCAST"
 	MsgRedirect   MsgType = "REDIRECT"
 	MsgError      MsgType = "ERROR"
+	MsgPong       MsgType = "PONG"
 )
 
 // json envelope
@@ -128,12 +130,12 @@ func (c *wsClient) send(msgType MsgType, payload interface{}) {
 
 // write loop
 func (c *wsClient) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case msg, ok := <-c.sendCh:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
@@ -144,7 +146,7 @@ func (c *wsClient) writePump() {
 			}
 		case <-ticker.C:
 			// Send WebSocket ping to keep the connection alive.
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
@@ -214,9 +216,9 @@ func (n *Node) readPump(conn *websocket.Conn) {
 	}()
 
 	conn.SetReadLimit(1 << 20) // 1 MB max message
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		return nil
 	})
 
@@ -228,7 +230,7 @@ func (n *Node) readPump(conn *websocket.Conn) {
 			}
 			return
 		}
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 		var env Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
@@ -253,6 +255,11 @@ func (n *Node) readPump(conn *websocket.Conn) {
 				break
 			}
 			n.handleSubmit(client, msg)
+
+		case MsgPing:
+			if client != nil {
+				client.send(MsgPong, map[string]interface{}{})
+			}
 
 		default:
 			n.logger.Warn("unknown message type", "type", env.Type)

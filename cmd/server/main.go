@@ -205,7 +205,7 @@ func main() {
 	sig := <-sigCh
 	logger.Info("received signal, shutting down", "signal", sig.String())
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	httpSrv.Shutdown(ctx) //nolint:errcheck
 }

@@ -260,6 +260,8 @@ let state = {
 
 let ws = null;             // WebSocket connection
 let submitTimer = null;    // 500ms submission interval
+let heartbeatTimer = null; // 2s heartbeat interval
+let lastMessageTime = 0;   // last time we received a message from server
 
 // connection logic
 
@@ -295,6 +297,9 @@ function onWsOpen() {
   setConnected(true);
   log('info', 'WebSocket connected. Sending CONNECT handshake.');
 
+  lastMessageTime = Date.now();
+  startHeartbeat();
+
   // Send CONNECT, including our last known rev for catch-up.
   sendMsg('CONNECT', {
     client_id: state.clientId,
@@ -305,7 +310,9 @@ function onWsOpen() {
 function onWsClose() {
   setConnected(false);
   clearInterval(submitTimer);
+  clearInterval(heartbeatTimer);
   submitTimer = null;
+  heartbeatTimer = null;
   ws = null;
   log('warn', 'WebSocket disconnected.');
   document.getElementById('editor').disabled = true;
@@ -317,12 +324,14 @@ function onWsMessage(evt) {
   catch (e) { log('error', 'Invalid JSON from server'); return; }
 
   const { type, payload } = env;
+  lastMessageTime = Date.now();
 
   switch (type) {
     case 'CONNECT_ACK': handleConnectAck(payload); break;
     case 'ACK': handleAck(payload); break;
     case 'BROADCAST': handleBroadcast(payload); break;
     case 'REDIRECT': handleRedirect(payload); break;
+    case 'PONG': /* handle app-level pong if needed */ break;
     case 'ERROR': log('error', `Server error ${payload.code}: ${payload.message}`); break;
     default: log('warn', `Unknown message type: ${type}`);
   }
@@ -575,6 +584,22 @@ function adjustCursor(pos, cs) {
     if (srcPos > pos) break;
   }
   return Math.max(0, newPos);
+}
+
+function startHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // 1. Send an app-level PING to keep the connection active and probe the network.
+    sendMsg('PING', {});
+
+    // 2. Watchdog: If we haven't heard from the server in 5 seconds, it's likely dead.
+    if (Date.now() - lastMessageTime > 5000) {
+      log('error', 'Heartbeat timeout — server is unresponsive. Closing connection.');
+      ws.close();
+    }
+  }, 2000);
 }
 
 // ─────────────────────────────────────────────────────────────────
