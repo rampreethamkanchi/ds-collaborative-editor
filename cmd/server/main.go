@@ -1,0 +1,211 @@
+// server entry point
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"distributed-editor/internal/fsm"
+	"distributed-editor/internal/ot"
+	"distributed-editor/internal/server"
+)
+
+// json config struct
+type Config struct {
+	NodeID    string   `json:"node_id"`
+	GRPCAddr  string   `json:"grpc_addr"`
+	WSAddr    string   `json:"ws_addr"`
+	DataDir   string   `json:"data_dir"`
+	Peers     []string `json:"peers"`
+	Bootstrap bool     `json:"bootstrap"`
+
+	// Optional timeout overrides
+	ElectionMin string `json:"election_min"`
+	ElectionMax string `json:"election_max"`
+	Heartbeat   string `json:"heartbeat"`
+}
+
+func main() {
+	// setup flags
+	configPath := flag.String("config", "", "Path to configuration JSON file")
+
+	nodeID    := flag.String("id",        "node-1",             "Unique node ID")
+	grpcAddr  := flag.String("grpc-addr", "localhost:12000",    "gRPC (Raft transport) listen address")
+	wsAddr    := flag.String("ws-addr",   "localhost:8080",     "WebSocket (client) listen address")
+	dataDir   := flag.String("data-dir",  "./data/node-1",      "Directory for BoltDB and snapshots")
+	peersFlag := flag.String("peers",     "localhost:12000",    "Comma-separated list of ALL peer gRPC addresses (including self)")
+	bootstrap := flag.Bool("bootstrap",   false,                "Bootstrap a new cluster (first startup only)")
+	initText  := flag.String("init-text", "",                   "Initial document text (only used with -bootstrap)")
+
+	// Timeouts
+	electionMin := flag.Duration("election-min", 0, "Minimum election timeout (e.g. 1000ms)")
+	electionMax := flag.Duration("election-max", 0, "Maximum election timeout (e.g. 2000ms)")
+	heartbeat   := flag.Duration("heartbeat",    0, "Heartbeat interval (e.g. 150ms)")
+
+	flag.Parse()
+
+	var peers []string
+
+	// read config file
+	if *configPath != "" {
+		file, err := os.Open(*configPath)
+		if err != nil {
+			log.Fatalf("failed to open config file: %v", err)
+		}
+		defer file.Close()
+
+		var cfg Config
+		if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+			log.Fatalf("failed to decode config file: %v", err)
+		}
+
+		// Config file overrides defaults (if field is not empty)
+		if cfg.NodeID != "" {
+			*nodeID = cfg.NodeID
+		}
+		if cfg.GRPCAddr != "" {
+			*grpcAddr = cfg.GRPCAddr
+		}
+		if cfg.WSAddr != "" {
+			*wsAddr = cfg.WSAddr
+		}
+		if cfg.DataDir != "" {
+			*dataDir = cfg.DataDir
+		}
+		if len(cfg.Peers) > 0 {
+			peers = cfg.Peers
+		}
+		if cfg.Bootstrap {
+			*bootstrap = true
+		}
+
+		// Durations from JSON
+		if cfg.ElectionMin != "" {
+			d, err := time.ParseDuration(cfg.ElectionMin)
+			if err == nil { *electionMin = d }
+		}
+		if cfg.ElectionMax != "" {
+			d, err := time.ParseDuration(cfg.ElectionMax)
+			if err == nil { *electionMax = d }
+		}
+		if cfg.Heartbeat != "" {
+			d, err := time.ParseDuration(cfg.Heartbeat)
+			if err == nil { *heartbeat = d }
+		}
+	}
+
+	// get peer list
+	if len(peers) == 0 {
+		peers = strings.Split(*peersFlag, ",")
+		for i, p := range peers {
+			peers[i] = strings.TrimSpace(p)
+		}
+	}
+
+	// setup logging
+	// Every log entry includes server_id so multi-server logs are easy to trace.
+	logHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(logHandler).With(
+		"server_id", *nodeID,
+		"grpc_addr", *grpcAddr,
+		"ws_addr",   *wsAddr,
+	)
+
+	logger.Info("starting node",
+		"node_id",   *nodeID,
+		"peers",     peers,
+		"bootstrap", *bootstrap,
+	)
+
+	// create fsm
+	sm := fsm.NewDocumentStateMachine("", logger)
+
+	// init raft
+	raftCfg := server.RaftConfig{
+		NodeID:    *nodeID,
+		BindAddr:  *grpcAddr,
+		DataDir:   *dataDir,
+		Peers:     peers,
+		Bootstrap: *bootstrap,
+
+		ElectionTimeoutMin: *electionMin,
+		ElectionTimeoutMax: *electionMax,
+		HeartbeatInterval:  *heartbeat,
+	}
+	rn, err := server.SetupRaft(raftCfg, sm, logger)
+	if err != nil {
+		logger.Error("failed to start raft", "err", err)
+		os.Exit(1)
+	}
+	defer rn.Shutdown()
+
+	// If we are bootstrapping and have initial text, we must propose it.
+	if *bootstrap && *initText != "" {
+		go func() {
+			logger.Info("waiting to become leader to propose initial text...")
+			for !rn.IsLeader() {
+				time.Sleep(100 * time.Millisecond)
+			}
+			entry := fsm.RaftLogEntry{
+				ClientID:     "system-bootstrap",
+				SubmissionID: 1,
+				BaseRev:      0,
+				Changeset:    ot.MakeInsert(0, 0, *initText),
+			}
+			data, err := fsm.MarshalEntry(entry)
+			if err == nil {
+				rn.Raft.Apply(data, 5*time.Second)
+				logger.Info("proposed initial text to cluster")
+			}
+		}()
+	}
+
+	// setup web server
+	node := server.NewNode(rn, sm, *wsAddr, logger)
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", node)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		state := "follower"
+		if rn.IsLeader() {
+			state = "leader"
+		}
+		fmt.Fprintf(w, `{"node_id":%q,"raft_state":%q,"head_rev":%d}`,
+			*nodeID, state, sm.HeadRev())
+	})
+	mux.Handle("/", http.FileServer(http.Dir("./web")))
+
+	httpSrv := &http.Server{
+		Addr:    *wsAddr,
+		Handler: mux,
+	}
+
+	// run web server
+	go func() {
+		logger.Info("HTTP/WebSocket server listening", "addr", *wsAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("HTTP server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// wait for shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logger.Info("received signal, shutting down", "signal", sig.String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	httpSrv.Shutdown(ctx) //nolint:errcheck
+}

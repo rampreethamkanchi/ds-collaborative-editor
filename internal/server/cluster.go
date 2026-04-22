@@ -1,0 +1,130 @@
+// raft setup
+package server
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+
+	"distributed-editor/internal/fsm"
+	"distributed-editor/internal/raft"
+	"distributed-editor/internal/store"
+)
+
+// cluster config
+type RaftConfig struct {
+	NodeID      string   // unique identifier for this node, e.g. "node-1"
+	BindAddr    string   // TCP listen address, e.g. "localhost:12000"
+	DataDir     string   // directory for BoltDB files
+	Peers       []string // network addresses of ALL cluster nodes
+	Bootstrap   bool     // not strictly needed for our custom raft, but kept for compatibility
+	InitialText string   // initial document text (only used if bootstrapping)
+
+	// Timeouts for Wi-Fi stability
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
+	HeartbeatInterval  time.Duration
+}
+
+// raft node wrapper
+type RaftNode struct {
+	Raft      *raft.RaftNode
+	Transport *raft.TCPTransport
+	LogStore  *store.BoltStore
+	FSM       *fsm.DocumentStateMachine
+}
+
+// initialize raft
+func SetupRaft(cfg RaftConfig, stateMachine *fsm.DocumentStateMachine, logger *slog.Logger) (*RaftNode, error) {
+	// Ensure data directory exists.
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("setup_raft: mkdir %q: %w", cfg.DataDir, err)
+	}
+
+	// setup storage
+	boltPath := filepath.Join(cfg.DataDir, "raft.db")
+	boltStore, err := store.NewBoltStore(boltPath)
+	if err != nil {
+		return nil, fmt.Errorf("setup_raft: bolt store: %w", err)
+	}
+
+	// setup transport
+	transport, err := raft.NewTCPTransport(cfg.BindAddr, logger)
+	if err != nil {
+		boltStore.Close()
+		return nil, fmt.Errorf("setup_raft: transport: %w", err)
+	}
+
+	// Build peer config
+	var peers []raft.PeerConfig
+	for _, p := range cfg.Peers {
+		// Use network address as ID for simplicity
+		peers = append(peers, raft.PeerConfig{
+			ID:      p,
+			Address: p,
+		})
+	}
+
+	// raft config
+	// Use values from cfg if provided, otherwise fallback to raft.DefaultConfig().
+	defaultRaftCfg := raft.DefaultConfig()
+
+	minTimeout := cfg.ElectionTimeoutMin
+	if minTimeout == 0 {
+		minTimeout = defaultRaftCfg.ElectionTimeoutMin
+	}
+	maxTimeout := cfg.ElectionTimeoutMax
+	if maxTimeout == 0 {
+		maxTimeout = defaultRaftCfg.ElectionTimeoutMax
+	}
+	hbInterval := cfg.HeartbeatInterval
+	if hbInterval == 0 {
+		hbInterval = defaultRaftCfg.HeartbeatInterval
+	}
+
+	raftCfg := &raft.Config{
+		ServerID:           cfg.BindAddr,
+		Peers:              peers,
+		LogStore:           boltStore,
+		StableStore:        boltStore,
+		FSM:                stateMachine,
+		ElectionTimeoutMin: minTimeout,
+		ElectionTimeoutMax: maxTimeout,
+		HeartbeatInterval:  hbInterval,
+		Logger:             logger,
+	}
+
+	// start raft
+	r, err := raft.NewRaftNode(raftCfg, transport)
+	if err != nil {
+		boltStore.Close()
+		transport.Shutdown()
+		return nil, fmt.Errorf("setup_raft: new raft: %w", err)
+	}
+
+	return &RaftNode{
+		Raft:      r,
+		Transport: transport,
+		LogStore:  boltStore,
+		FSM:       stateMachine,
+	}, nil
+}
+
+// stop server
+func (n *RaftNode) Shutdown() {
+	n.Raft.Shutdown()
+	n.Transport.Shutdown()
+	n.LogStore.Close()
+}
+
+// leader check
+func (n *RaftNode) IsLeader() bool {
+	return n.Raft.IsLeader()
+}
+
+// LeaderAddr returns the address of the current Raft leader, or "" if unknown.
+func (n *RaftNode) LeaderAddr() string {
+	return n.Raft.LeaderAddr()
+}
